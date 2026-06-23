@@ -15,6 +15,7 @@ export const config = {
 // TTFT 仅作首响兜底（5s 内未首响 → 主动 504，便于上游 failover / key rotate）。
 // 首响后透传流式 body 不限时，受 maxDuration 300s wall 管控。
 const FETCH_TTFT_TIMEOUT_MS = 30_000;
+const STREAM_SILENT_TIMEOUT_MS = 30_000;
 
 const PROXY_AUTH = new Map<string, string>();
 let authInitialized = false;
@@ -73,6 +74,58 @@ function buildTargetUrl(requestUrl: string): { url: string; ok: boolean } {
 
 function log(ev: Record<string, unknown>): void {
   console.log(JSON.stringify(ev));
+}
+
+// wrapStream: 自建 ReadableStream + reader.read 拉数据 + setTimeout 30s 静默
+function wrapStream(body: ReadableStream<Uint8Array>, start: number): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  let aborted = false;
+  let firstChunk = true;
+  let stallTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const armStall = () => {
+    if (stallTimer) clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      if (aborted) return;
+      aborted = true;
+      log({ ev: 'proxy_stream_close', ms: Date.now() - start, ok: false, err: 'stall timeout' });
+      reader.cancel().catch(() => {});
+    }, STREAM_SILENT_TIMEOUT_MS);
+  };
+  armStall();
+
+  return new ReadableStream<Uint8Array>({
+    async pull(ctrl) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          aborted = true;
+          if (stallTimer) clearTimeout(stallTimer);
+          log({ ev: 'proxy_stream_close', ms: Date.now() - start, ok: true });
+          ctrl.close();
+          return;
+        }
+        if (firstChunk) {
+          log({ ev: 'proxy_stream_first_chunk', ms: Date.now() - start });
+          firstChunk = false;
+        }
+        armStall();
+        ctrl.enqueue(value);
+      } catch (e) {
+        aborted = true;
+        if (stallTimer) clearTimeout(stallTimer);
+        const msg = (e as Error)?.message || String(e);
+        log({ ev: 'proxy_stream_close', ms: Date.now() - start, ok: false, err: msg });
+        reader.cancel().catch(() => {});
+        ctrl.error(e);
+      }
+    },
+    cancel() {
+      aborted = true;
+      if (stallTimer) clearTimeout(stallTimer);
+      reader.cancel().catch(() => {});
+    },
+  });
 }
 
 const HOP_BY_HOP = [
@@ -157,35 +210,24 @@ export default {
           request.signal.addEventListener('abort', () => pipeController.abort(), { once: true });
         }
       }
-      const STALL_TIMEOUT_MS = 30_000;
-      let firstChunk = true;
-      let stallTimer: ReturnType<typeof setTimeout> | null = null;
-      const armStall = () => {
-        if (stallTimer) clearTimeout(stallTimer);
-        stallTimer = setTimeout(() => pipeController.abort(), STALL_TIMEOUT_MS);
-      };
-      armStall();
-      const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>({
-        transform(chunk, ctrl) {
-          if (firstChunk) {
-            log({ ev: 'proxy_stream_first_chunk', ms: Date.now() - start });
-            firstChunk = false;
-          }
-          armStall();
-          ctrl.enqueue(chunk);
-        },
-      });
-      upstream.body!.pipeTo(writable, { signal: pipeController.signal })
-        .then(() => {
-          if (stallTimer) clearTimeout(stallTimer);
-          log({ ev: 'proxy_stream_close', ms: Date.now() - start, ok: true });
-        })
-        .catch((e) => {
-          if (stallTimer) clearTimeout(stallTimer);
-          log({ ev: 'proxy_stream_close', ms: Date.now() - start, ok: false, err: (e as Error)?.message || String(e) });
-        });
+      if (!upstream.body) {
+        log({ ev: 'proxy_stream_close', ms: Date.now() - start, ok: true, empty: true });
+        return new Response(null, { status: upstream.status, statusText: upstream.statusText, headers: outHeaders });
+      }
+      const wrapped = wrapStream(upstream.body, start);
 
-      return new Response(readable, {
+      // client signal: 客户端断 → wrapped.cancel (wrapStream cancel 触发 reader.cancel)
+      if (request.signal) {
+        if (request.signal.aborted) {
+          try { wrapped.cancel(); } catch {}
+        } else {
+          request.signal.addEventListener('abort', () => {
+            try { wrapped.cancel(); } catch {}
+          }, { once: true });
+        }
+      }
+
+      return new Response(wrapped, {
         status: upstream.status,
         statusText: upstream.statusText,
         headers: outHeaders,
