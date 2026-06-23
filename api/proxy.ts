@@ -149,7 +149,7 @@ export default {
     const pathVal = url.searchParams.get('path');
     const start = Date.now();
 
-    if (pathVal === '' || pathVal === 'health' || !pathVal.includes('/')) {
+    if (!pathVal || pathVal === '' || pathVal === 'health' || !pathVal.includes('/')) {
       return new Response('ok', { status: 200 });
     }
 
